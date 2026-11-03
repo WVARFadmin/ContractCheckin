@@ -1,0 +1,17 @@
+{
+  "name": "contract-checkin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Green / Yellow / Red contract check-in app for CRP janitorial supervisors",
+  "type": "module",
+  "scripts": {
+    "dev": "netlify dev",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@netlify/database": "^2.0.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.15"
+  }
+}
