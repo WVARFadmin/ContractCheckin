@@ -505,14 +505,30 @@ async function viewStatewide() {
     </div>`);
 }
 
+// What happened to the sign-in invitation, in words for the admin.
+// kind: 'ok' shows as a toast; anything else stays on screen until the next action.
+function inviteMessage(email, r) {
+  switch (r.invite) {
+    case 'sent': return { kind: 'ok', text: `Invitation email sent to ${email}.` };
+    case 'already_registered': return { kind: 'ok', text: `${email} already has a login — they can sign in now.` };
+    case 'failed': return { kind: 'warn', text: `${email} was saved, but the invitation email could not be sent (${r.invite_error}). Try "Send invite" again, or contact your WVARF administrator.` };
+    case 'unavailable': return { kind: 'warn', text: `${email} was saved, but invitations can't be sent from this site yet. Contact your WVARF administrator.` };
+    default: return null;
+  }
+}
+let adminNotice = null;
+
 async function viewAdmin() {
   const wvarf = me.is_wvarf_admin;
   const [members, crps] = await Promise.all([api('/admin/members'), wvarf ? api('/admin/crps') : Promise.resolve([])]);
   const roleName = { supervisor: 'Supervisor', crp_admin: 'CRP admin', wvarf_admin: 'WVARF admin' };
+  const notice = adminNotice;
+  adminNotice = null;
   setMain(`
     <div class="page-head"><div><h1>People${wvarf ? ' & CRPs' : ''}</h1>
-      <div class="sub">Add someone's email here, then invite them to sign in (see the setup guide). Everyone at a CRP sees all of that CRP's contracts.</div></div></div>
+      <div class="sub">Adding a new person emails them an invitation to set their password and sign in. Everyone at a CRP sees all of that CRP's contracts.</div></div></div>
     <div class="stack">
+      ${notice ? `<div class="form-error" role="alert">${esc(notice)}</div>` : ''}
       ${!wvarf && me.crp ? `<form class="card stack" id="settings" novalidate>
         <h2 class="small" style="font-size:16px;color:var(--blue)">${esc(me.crp.name)} settings</h2>
         <div class="field"><label for="f-sched">Call every contract</label>
@@ -544,10 +560,12 @@ async function viewAdmin() {
       <section class="card">
         <h2 class="section-title" style="margin-top:0">People (${members.length})</h2>
         <div class="tablewrap"><table>
-          <thead><tr><th>Email</th><th>Name</th>${wvarf ? '<th>CRP</th>' : ''}<th>Role</th><th></th></tr></thead>
-          <tbody>${members.map((m) => `<tr><td>${esc(m.email)}</td><td>${esc(m.name || '')}</td>${wvarf ? `<td>${esc(m.crp_name || '—')}</td>` : ''}
+          <thead><tr><th>Person</th>${wvarf ? '<th>CRP</th>' : ''}<th>Role</th><th></th></tr></thead>
+          <tbody>${members.map((m) => `<tr><td class="email">${m.name ? `<strong>${esc(m.name)}</strong><br>` : ''}<span class="small">${esc(m.email)}</span></td>${wvarf ? `<td>${esc(m.crp_name || '—')}</td>` : ''}
             <td>${roleName[m.role]}</td>
-            <td class="num">${m.email !== me.email ? `<button class="btn danger small" type="button" data-remove="${esc(m.email)}">Remove</button>` : '<span class="muted small">You</span>'}</td></tr>`).join('')}</tbody>
+            <td class="num">${m.email !== me.email ? `<div class="actions">
+              <button class="btn secondary small" type="button" data-invite="${esc(m.email)}">Send invite</button>
+              <button class="btn danger small" type="button" data-remove="${esc(m.email)}">Remove</button></div>` : '<span class="muted small">You</span>'}</td></tr>`).join('')}</tbody>
         </table></div>
       </section>
       ${wvarf && crps.length ? `<section class="card"><h2 class="section-title" style="margin-top:0">CRPs (${crps.length})</h2>
@@ -560,9 +578,23 @@ async function viewAdmin() {
   const newcrp = main.querySelector('#newcrp');
   if (newcrp) wireForm(newcrp, async (d) => { await api('/admin/crps', { method: 'POST', body: d }); toast('CRP added'); viewAdmin().catch(errorView); });
   wireForm(main.querySelector('#newmember'), async (d) => {
-    await api('/admin/members', { method: 'POST', body: d });
-    toast('Person saved');
+    const saved = await api('/admin/members', { method: 'POST', body: d });
+    const msg = inviteMessage(saved.email, saved);
+    if (msg && msg.kind !== 'ok') adminNotice = msg.text;
+    toast(msg && msg.kind === 'ok' ? `Saved. ${msg.text}` : 'Person saved');
     viewAdmin().catch(errorView);
+  });
+  main.querySelectorAll('[data-invite]').forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const r = await api(`/admin/members/${encodeURIComponent(b.dataset.invite)}/invite`, { method: 'POST', body: {} });
+        const msg = inviteMessage(r.email, r);
+        if (msg && msg.kind === 'ok') toast(msg.text);
+        else { adminNotice = msg ? msg.text : 'The invitation could not be sent.'; viewAdmin().catch(errorView); }
+      } catch (ex) { toast(ex.message); }
+      finally { b.disabled = false; }
+    };
   });
   main.querySelectorAll('[data-remove]').forEach((b) => {
     b.onclick = async () => {

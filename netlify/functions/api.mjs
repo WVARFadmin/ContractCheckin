@@ -25,9 +25,31 @@ async function getUser(req) {
   return { email: user.email, name: (user.user_metadata && user.user_metadata.full_name) || null };
 }
 
+// Send the Netlify Identity invitation email — the same email the dashboard's
+// "Invite users" button sends. Netlify gives functions an admin ("operator") token
+// for this site's Identity service; it never reaches the browser.
+async function inviteUser(email, name) {
+  const identity = globalThis.netlifyIdentityContext;
+  if (!identity || !identity.url || !identity.token) {
+    throw new Error('Netlify Identity is not turned on for this site');
+  }
+  const res = await fetch(`${identity.url}/invite`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${identity.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ email, data: name ? { full_name: name } : {} }),
+  });
+  if (res.ok) return 'sent';
+  const body = await res.json().catch(() => ({}));
+  const msg = body.msg || body.error_description || body.error || `Netlify returned ${res.status}`;
+  // Someone who already has a login (accepted an earlier invite) can just sign in.
+  if (res.status === 422 && /already/i.test(msg)) return 'already_registered';
+  throw new Error(msg);
+}
+
 const handle = createApi({
   query,
   getUser,
+  inviteUser,
   adminEmails: (process.env.ADMIN_EMAILS || '').split(','),
 });
 

@@ -182,6 +182,12 @@ table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th { text-align: left; color: var(--blue); border-bottom: 2px solid var(--blue); padding: 8px; white-space: nowrap; }
 td { border-bottom: 1px solid var(--line); padding: 10px 8px; vertical-align: middle; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td .actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
+td .actions .btn { white-space: nowrap; }
+@media (max-width: 560px) {
+  td .actions { flex-direction: column; align-items: stretch; }
+  td.email { overflow-wrap: anywhere; min-width: 110px; }
+}
 .bar { display: flex; height: 16px; border-radius: 4px; overflow: hidden; background: #E6E9EE; min-width: 140px; }
 .bar i { display: block; height: 100%; }
 .bar .g { background: var(--green); } .bar .y { background: var(--yellow); } .bar .r { background: var(--red); } .bar .n { background: #B5BCC6; }

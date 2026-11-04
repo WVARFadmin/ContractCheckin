@@ -7,6 +7,16 @@ import { createApi } from '../lib/api-core.mjs';
 let db;
 let clock = new Date('2026-11-03T15:00:00Z'); // a Tuesday
 let handle;
+// Fake Netlify Identity: records invites; some addresses behave specially.
+const invited = [];
+const registered = new Set(['already@alpha.org']);
+let identityDown = false;
+async function inviteUser(email, name) {
+  if (identityDown) throw new Error('Netlify returned 503');
+  if (registered.has(email)) return 'already_registered';
+  invited.push({ email, name });
+  return 'sent';
+}
 
 before(async () => {
   db = new PGlite();
@@ -21,6 +31,7 @@ before(async () => {
       const a = req.headers.get('authorization') || '';
       return a.startsWith('Bearer ') ? { email: a.slice(7), name: null } : null;
     },
+    inviteUser,
     adminEmails: ['boss@wvarf.org'],
     now: () => clock,
   });
@@ -71,6 +82,15 @@ test('WVARF admin creates CRPs and assigns people', async () => {
   assert.equal(noCrp.status, 400);
 });
 
+test('adding a new person sends their sign-in invitation automatically', async () => {
+  assert.deepEqual(invited.map((i) => i.email), ['ann@alpha.org', 'bob@beta.org']);
+  // Updating someone already on the list does not email them again.
+  const r = await call('boss@wvarf.org', 'POST', '/admin/members', { email: 'ann@alpha.org', name: 'Ann', crp_id: crpA.id, role: 'crp_admin' });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.invite, undefined);
+  assert.equal(invited.length, 2);
+});
+
 test('supervisors cannot use WVARF-only routes', async () => {
   assert.equal((await call('bob@beta.org', 'GET', '/statewide')).status, 403);
   assert.equal((await call('bob@beta.org', 'POST', '/admin/crps', { name: 'Hack' })).status, 403);
@@ -78,15 +98,61 @@ test('supervisors cannot use WVARF-only routes', async () => {
 });
 
 test('CRP admin adds a supervisor to their own CRP only', async () => {
-  const r = await call('ann@alpha.org', 'POST', '/admin/members', { email: 'sam@alpha.org', crp_id: crpB.id });
+  const r = await call('ann@alpha.org', 'POST', '/admin/members', { email: 'sam@alpha.org', name: 'Sam', crp_id: crpB.id });
   assert.equal(r.status, 201);
   assert.equal(r.body.crp_id, crpA.id, 'crp_id from body is ignored for CRP admins');
+  assert.equal(r.body.invite, 'sent', 'a CRP admin\'s new supervisor is invited without WVARF');
+  assert.deepEqual(invited.at(-1), { email: 'sam@alpha.org', name: 'Sam' });
   const steal = await call('ann@alpha.org', 'POST', '/admin/members', { email: 'bob@beta.org' });
   assert.equal(steal.status, 409);
   const escalate = await call('ann@alpha.org', 'POST', '/admin/members', { email: 'z@alpha.org', role: 'wvarf_admin' });
   assert.equal(escalate.status, 403);
   const list = await call('ann@alpha.org', 'GET', '/admin/members');
   assert.deepEqual(list.body.map((m) => m.email).sort(), ['ann@alpha.org', 'sam@alpha.org']);
+});
+
+test('someone who already has a login is told so, not emailed again', async () => {
+  const r = await call('ann@alpha.org', 'POST', '/admin/members', { email: 'already@alpha.org' });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.invite, 'already_registered');
+});
+
+test('a failed invitation still saves the person and says why', async () => {
+  identityDown = true;
+  const r = await call('ann@alpha.org', 'POST', '/admin/members', { email: 'pat@alpha.org' });
+  identityDown = false;
+  assert.equal(r.status, 201);
+  assert.equal(r.body.email, 'pat@alpha.org');
+  assert.equal(r.body.invite, 'failed');
+  assert.match(r.body.invite_error, /503/);
+  // "Send invite" retries it.
+  const again = await call('ann@alpha.org', 'POST', '/admin/members/pat%40alpha.org/invite', {});
+  assert.equal(again.status, 201);
+  assert.equal(again.body.invite, 'sent');
+});
+
+test('"Send invite" respects CRP boundaries', async () => {
+  assert.equal((await call('ann@alpha.org', 'POST', '/admin/members/bob%40beta.org/invite', {})).status, 404);
+  assert.equal((await call('bob@beta.org', 'POST', '/admin/members/ann%40alpha.org/invite', {})).status, 404);
+  const sam = await call('sam@alpha.org', 'POST', '/admin/members/pat%40alpha.org/invite', {});
+  assert.equal(sam.status, 404, 'supervisors cannot send invites');
+  const boss = await call('boss@wvarf.org', 'POST', '/admin/members/bob%40beta.org/invite', {});
+  assert.equal(boss.body.invite, 'sent', 'WVARF can resend anyone');
+});
+
+test('without Identity set up, people are saved and the screen is told', async () => {
+  const bare = createApi({
+    query: async (text, params) => (await db.query(text, params)).rows,
+    getUser: async () => ({ email: 'boss@wvarf.org' }),
+    adminEmails: ['boss@wvarf.org'],
+  });
+  const res = await bare(new Request('https://example.test/api/admin/members', {
+    method: 'POST', headers: { authorization: 'Bearer x', 'content-type': 'application/json' },
+    body: JSON.stringify({ email: 'nobody@beta.org', crp_id: crpB.id }) }));
+  const body = await res.json();
+  assert.equal(res.status, 201);
+  assert.equal(body.invite, 'unavailable');
+  await db.query('DELETE FROM members WHERE email = $1', ['nobody@beta.org']);
 });
 
 test('contracts are created with validation', async () => {

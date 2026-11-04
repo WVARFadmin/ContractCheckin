@@ -23,12 +23,19 @@ Every call and visit records who logged it and when.
 
 1. **Create the Netlify site.** In Netlify, add a new site by importing this GitHub repository. Netlify reads `netlify.toml`, so leave the build settings as they are and deploy. The database and its tables are created during this first deploy.
 2. **Turn on sign-in.** In the site's settings, enable **Identity**. Set registration to **Invite only** so only people you invite can create a login.
-3. **Name the WVARF administrators.** In the site's environment variables, add `ADMIN_EMAILS` with a comma-separated list, for example `nshippy@wvarf.org`. These people are always WVARF admins. Redeploy after adding it.
-4. **Invite yourself.** From the Identity tab, invite your own email, accept the email invitation, and set a password. Sign in — you'll land on the statewide view.
-5. **Add CRPs and people.** In the app, open **People**: add each CRP, then add each person's email with their CRP and role.
-6. **Send their invitations.** From the Netlify Identity tab, invite the same email addresses. When they accept and sign in, they land in their CRP.
+3. **Name the WVARF administrators.** In the project's settings, open **Environment variables** and choose **Add a variable**. Enter:
+   - **Key:** `ADMIN_EMAILS`
+   - **Secret:** leave unchecked
+   - **Scopes:** All scopes
+   - **Values:** Same value for all deploy contexts, then type the email, for example `nshippy@wvarf.org`. For more than one, separate them with commas and no spaces.
 
-> Both steps 5 and 6 are needed: the app decides *what* someone can see; the Netlify invitation lets them *sign in*. A CRP admin can add their own people in the app, but a Netlify team member sends the invitations.
+   Click **Create variable**. These people are always WVARF admins. Then go to **Deploys** and use **Trigger deploy** so the app picks up the setting.
+4. **Invite yourself.** From the Identity tab, invite your own email, accept the email invitation, and set a password. Sign in — you'll land on the statewide view.
+5. **Add CRPs and people.** In the app, open **People**: add each CRP, then add each person's email with their CRP and role. **Adding a new person emails them their invitation automatically** — no Netlify step. They click the link, set a password, and land in their CRP.
+
+> CRP admins add and invite their own supervisors the same way; WVARF doesn't need to be involved. Each person on the People screen has a **Send invite** button to resend an invitation that was missed or expired. The invitation comes from a Netlify address, so ask people to check their spam folder.
+>
+> If someone was added before automatic invitations were turned on, use **Send invite** next to their name.
 
 ## How the rules work
 

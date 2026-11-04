@@ -21,6 +21,12 @@ const handle = createApi({
     const a = req.headers.get('authorization') || '';
     return a.startsWith('Bearer ') ? { email: a.slice(7), name: null } : null;
   },
+  // No real email locally: print the invite instead. Emails starting "fail" simulate an outage.
+  inviteUser: async (email) => {
+    if (email.startsWith('fail')) throw new Error('Netlify returned 503');
+    console.log(`[preview] would email a sign-in invitation to ${email}`);
+    return 'sent';
+  },
   adminEmails: (process.env.ADMIN_EMAILS || 'admin@wvarf.test').split(','),
 });
 
