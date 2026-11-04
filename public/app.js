@@ -1,7 +1,14 @@
 // Contract Check-In — single-page app (no build step).
 // Routes use the URL hash: #/, #/contract/12, #/contract/12/call, #/queue, ...
+//
+// Sign-in uses Netlify Identity through Netlify's @netlify/identity library
+// (bundled into /vendor by `npm run build:vendor`). The sign-in, reset and invite
+// forms are this app's own forms, so browsers and password managers can save
+// passwords. Reset and invite links are only redeemed when the person submits a
+// new password — never just because the link was opened.
 
-const identity = window.netlifyIdentity;
+import * as auth from '/vendor/netlify-identity.js';
+
 const main = document.getElementById('main');
 const nav = document.getElementById('nav');
 const who = document.getElementById('who');
@@ -16,6 +23,17 @@ const SCHEDULES = { weekly: 'Weekly', biweekly: 'Every 2 weeks', monthly: 'Month
 
 let me = null;            // result of /api/me
 let listFilter = 'all';   // contracts list filter
+
+// Practice mode: a WVARF admin working inside a demo CRP (made-up data only).
+const PRACTICE_KEY = 'practice-crp';
+function getPractice() {
+  try { return JSON.parse(sessionStorage.getItem(PRACTICE_KEY) || 'null'); } catch { return null; }
+}
+function setPractice(crp) {
+  try { if (crp) sessionStorage.setItem(PRACTICE_KEY, JSON.stringify(crp)); else sessionStorage.removeItem(PRACTICE_KEY); } catch { /* ignore */ }
+  me = null;
+  listFilter = 'all';
+}
 
 // ---------- helpers ----------
 
@@ -44,6 +62,106 @@ const today = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD in loc
 const telHref = (p) => `tel:${String(p || '').replace(/[^\d+]/g, '')}`;
 const pill = (c) => c ? `<span class="pill ${c}">${COLOR_INFO[c].label}</span>` : '<span class="pill none">Not called</span>';
 const typeTag = (t) => t === 'state' ? '<span class="tag">WVARF / State</span>' : '<span class="tag other">Other</span>';
+const demoTag = (c) => (c && c.is_demo ? ' <span class="tag demo">Demo</span>' : '');
+
+// ---------- trend history (charts are plain SVG; every color also has a word) ----------
+
+const TREND = {
+  improving: { word: 'Improving', arrow: 'M4 12l5-5 4 4 7-7M14 4h6v6', cls: 'up' },
+  steady: { word: 'Steady', arrow: 'M3 12h16M15 8l4 4-4 4', cls: 'flat' },
+  slipping: { word: 'Slipping', arrow: 'M4 6l5 5 4-4 7 7M14 18h6v-6', cls: 'down' },
+  new: { word: 'New — not enough history', arrow: 'M12 6v6l4 2', cls: 'new' },
+};
+const COLOR_HEX = { green: '#2E7D32', yellow: '#F2B705', red: '#C62828' };
+const weekLabel = (iso) => fmtDate(iso, { month: 'short', day: 'numeric' });
+
+function trendBadge(trend, { long = false } = {}) {
+  const t = TREND[trend.direction] || TREND.new;
+  const detail = long && trend.change !== null
+    ? ` <span class="muted">· score ${trend.recent}, ${trend.change >= 0 ? 'up' : 'down'} ${Math.abs(trend.change)} from ${trend.prior}</span>` : '';
+  return `<span class="trend ${t.cls}"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"
+    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${t.arrow}"/></svg>${t.word}${detail}</span>`;
+}
+
+// Tiny line of the service score (0–100) over the 12 weeks; gaps where there was no color yet.
+function sparkline(scores, label) {
+  const w = 96; const h = 28; const pad = 3;
+  const x = (i) => pad + (i * (w - 2 * pad)) / Math.max(1, scores.length - 1);
+  const y = (v) => pad + ((100 - v) * (h - 2 * pad)) / 100;
+  let d = ''; let pen = false;
+  scores.forEach((v, i) => {
+    if (v === null || v === undefined) { pen = false; return; }
+    d += `${pen ? 'L' : 'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`; pen = true;
+  });
+  const lastI = scores.map((v, i) => (v === null || v === undefined ? -1 : i)).filter((i) => i >= 0).pop();
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="${esc(label)}">
+    <title>${esc(label)}</title>
+    <line x1="${pad}" x2="${w - pad}" y1="${y(50)}" y2="${y(50)}" class="spark-mid"/>
+    ${d ? `<path d="${d}" class="spark-line"/>` : ''}
+    ${lastI !== undefined ? `<circle cx="${x(lastI)}" cy="${y(scores[lastI])}" r="3" class="spark-dot"/>` : ''}
+  </svg>`;
+}
+const sparkLabel = (scores) => {
+  const known = scores.filter((v) => v !== null && v !== undefined);
+  return known.length ? `Service score over 12 weeks: ${known.join(', ')} (100 = all green, 0 = all red)` : 'No calls yet';
+};
+
+// One square per week, colored by that week's status, with the word in each tooltip.
+function weekStrip(colors, ends) {
+  return `<div class="strip" role="list" aria-label="Color each week, oldest first">${colors.map((c, i) => `
+    <span role="listitem" class="cell ${c || 'none'}" title="Week ending ${weekLabel(ends[i])}: ${c ? COLOR_INFO[c].label : 'no color yet'}">
+      <span class="sr">Week ending ${weekLabel(ends[i])}: ${c ? COLOR_INFO[c].label : 'no color yet'}</span></span>`).join('')}
+  </div>
+  <div class="strip-axis small muted"><span>12 weeks ago</span><span>This week</span></div>`;
+}
+
+// Share of contracts green / yellow / red each week, as 100% stacked bars.
+function trendChart(weeks, title) {
+  const narrow = window.matchMedia('(max-width: 560px)').matches;
+  const W = 640; const H = narrow ? 300 : 210; const L = narrow ? 62 : 36; const R = 8; const T = 12; const B = narrow ? 34 : 26;
+  const n = weeks.length; const slot = (W - L - R) / n; const bw = Math.min(34, slot - 6);
+  const yv = (pct) => T + ((100 - pct) * (H - T - B)) / 100;
+  const bars = weeks.map((wk, i) => {
+    const total = wk.green + wk.yellow + wk.red;
+    const x = L + i * slot + (slot - bw) / 2;
+    const tip = total
+      ? `Week ending ${weekLabel(wk.week_end)}: ${wk.green} green, ${wk.yellow} yellow, ${wk.red} red · score ${wk.score}`
+      : `Week ending ${weekLabel(wk.week_end)}: no colors yet`;
+    let acc = 0; let segs = '';
+    ['green', 'yellow', 'red'].forEach((k) => {
+      if (!total || !wk[k]) return;
+      const pct = (wk[k] / total) * 100;
+      const y1 = yv(acc + pct); const y0 = yv(acc);
+      const gap = acc > 0 ? 2 : 0; // 2px surface gap between stacked segments
+      segs += `<rect x="${x.toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0, y0 - y1 - gap).toFixed(1)}" rx="2" fill="${COLOR_HEX[k]}"/>`;
+      acc += pct;
+    });
+    const label = i % (narrow ? 4 : 3) === (n - 1) % (narrow ? 4 : 3) ? `<text x="${(x + bw / 2).toFixed(1)}" y="${H - 6}" class="ax" text-anchor="middle">${weekLabel(wk.week_end)}</text>` : '';
+    return `<g class="bar"><title>${esc(tip)}</title><rect x="${(L + i * slot).toFixed(1)}" y="${T}" width="${slot.toFixed(1)}" height="${H - T - B}" fill="transparent"/>${segs}${label}</g>`;
+  }).join('');
+  const grid = [0, 50, 100].map((p) => `<line x1="${L}" x2="${W - R}" y1="${yv(p)}" y2="${yv(p)}" class="grid"/><text x="${L - 6}" y="${yv(p) + 4}" class="ax" text-anchor="end">${p}%</text>`).join('');
+  const rows = weeks.map((wk) => `<tr><td>${weekLabel(wk.week_end)}</td><td class="num">${wk.green}</td><td class="num">${wk.yellow}</td><td class="num">${wk.red}</td><td class="num">${wk.score ?? '—'}</td></tr>`).join('');
+  return `<figure class="chart">
+    <div class="legend" aria-hidden="true"><span><i class="dot green"></i>Green</span><span><i class="dot yellow"></i>Yellow</span><span><i class="dot red"></i>Red</span>
+      <span class="muted small">Share of contracts each week · hover a bar, or open the table, for counts</span></div>
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(title)}">${grid}${bars}</svg>
+    <details class="small"><summary>Show as a table</summary>
+      <div class="tablewrap"><table><thead><tr><th>Week ending</th><th class="num">Green</th><th class="num">Yellow</th><th class="num">Red</th><th class="num">Score</th></tr></thead><tbody>${rows}</tbody></table></div>
+    </details>
+  </figure>`;
+}
+
+function trendCard(history, scopeLabel) {
+  const t = history.trend;
+  const sentence = t.change === null
+    ? 'Not enough history yet. Trends appear after about 5 weeks of calls.'
+    : `Service score is <strong>${t.recent}</strong> over the last 4 weeks, ${t.change > 0 ? 'up' : t.change < 0 ? 'down' : 'no change'}${t.change ? ` ${Math.abs(t.change)} points` : ''} from <strong>${t.prior}</strong> about 2–3 months ago.`;
+  return `<section class="card stack trendcard">
+    <div class="row" style="justify-content:space-between"><h2 class="cardtitle">${esc(scopeLabel)} · last 12 weeks</h2>${trendBadge(t)}</div>
+    <p class="small" style="margin:0">${sentence} <span class="muted">Score: green 100, yellow 50, red 0, averaged across contracts.</span></p>
+    ${trendChart(history.weeks, `${scopeLabel}: share of contracts green, yellow and red each week for 12 weeks`)}
+  </section>`;
+}
 
 function toast(msg) {
   const t = document.getElementById('toast');
@@ -57,6 +175,7 @@ const icons = {
   list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>',
   pin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.1-7-11a7 7 0 0 1 14 0c0 4.9-7 11-7 11z"/><circle cx="12" cy="10" r="2.5"/></svg>',
   chart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
+  play: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M10 9l5 3-5 3z"/></svg>',
   people: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M21.5 20a6.5 6.5 0 0 0-4-6"/></svg>',
   back: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>',
   phone: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z"/></svg>',
@@ -64,17 +183,38 @@ const icons = {
 
 // ---------- API ----------
 
+function readCookie(name) {
+  const m = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+// The library keeps the current login in the nf_jwt cookie and refreshes it
+// shortly before it expires.
+async function accessToken() {
+  try { await auth.refreshSession(); } catch { /* fall through to the cookie */ }
+  return readCookie('nf_jwt');
+}
+
 async function api(path, { method = 'GET', body } = {}) {
-  const user = identity.currentUser();
-  if (!user) throw Object.assign(new Error('Please sign in'), { status: 401 });
-  const token = await user.jwt(); // refreshes the token when it is about to expire
+  const token = await accessToken();
+  if (!token) throw Object.assign(new Error('Please sign in'), { status: 401 });
+  const practice = getPractice();
   const res = await fetch(`/api${path}`, {
     method,
-    headers: { authorization: `Bearer ${token}`, ...(body ? { 'content-type': 'application/json' } : {}) },
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      ...(practice ? { 'x-practice-crp': String(practice.id) } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   let data = null;
   try { data = await res.json(); } catch { /* empty */ }
+  if (!res.ok && practice && res.status === 403 && /practice mode/i.test((data && data.error) || '')) {
+    // The demo CRP was removed while practicing: leave practice mode.
+    setPractice(null);
+    throw Object.assign(new Error('That demo CRP no longer has demo data, so practice mode ended. Open the Demo tab to load it again.'), { status: 409 });
+  }
   if (!res.ok) throw Object.assign(new Error((data && data.error) || `Request failed (${res.status})`), { status: res.status });
   return data;
 }
@@ -114,6 +254,18 @@ function wireForm(form, submit) {
 // ---------- shell ----------
 
 function renderShell(route) {
+  const banner = document.getElementById('practice');
+  if (!me || !me.practice) { banner.hidden = true; banner.innerHTML = ''; }
+  else {
+    banner.hidden = false;
+    banner.innerHTML = `<div class="practice-inner"><span><strong>Practice mode</strong> · ${esc(me.crp.name)} — made-up demo data. You're acting as its CRP admin; nothing here is real.</span>
+      <button class="btn small" type="button" id="exit-practice">Exit practice</button></div>`;
+    document.getElementById('exit-practice').onclick = () => {
+      setPractice(null);
+      if (location.hash === '#/demo') window.dispatchEvent(new HashChangeEvent('hashchange'));
+      else location.hash = '#/demo';
+    };
+  }
   if (!me) { nav.innerHTML = ''; who.innerHTML = ''; return; }
   const tabs = [];
   if (me.crp) {
@@ -121,14 +273,22 @@ function renderShell(route) {
     tabs.push(['#/queue', 'Visits', icons.pin, ['queue']]);
   }
   if (me.is_wvarf_admin) tabs.push(['#/statewide', 'Statewide', icons.chart, ['statewide']]);
+  if (me.is_wvarf_admin) tabs.push(['#/demo', 'Demo', icons.play, ['demo']]);
   if (me.can_admin_crp || me.is_wvarf_admin) tabs.push(['#/admin', 'People', icons.people, ['admin']]);
   nav.innerHTML = tabs.length > 1
     ? tabs.map(([href, label, icon, keys]) =>
       `<a href="${href}" ${keys.includes(route) ? 'aria-current="page"' : ''}>${icon}${label}</a>`).join('')
     : '';
   who.innerHTML = `<span class="crpname">${esc(me.crp ? me.crp.name : (me.is_wvarf_admin ? 'WVARF' : ''))}</span>
-    <button class="linkbtn" type="button" id="signout">Sign out</button>`;
-  document.getElementById('signout').onclick = () => identity.logout();
+    <a class="linkbtn" href="#/account" ${route === 'account' ? 'aria-current="page"' : ''}>Account</a>`;
+}
+
+async function signOut() {
+  try { await auth.logout(); } catch { /* the cookie is cleared either way */ }
+  setPractice(null);
+  me = null;
+  history.replaceState(null, '', '#/');
+  renderSignIn({ note: 'You are signed out.' });
 }
 
 function setMain(html) {
@@ -137,24 +297,206 @@ function setMain(html) {
 }
 
 function errorView(ex) {
-  if (ex.status === 401) return renderSignedOut();
+  if (ex.status === 401) { me = null; return renderSignIn({ note: 'Please sign in again.' }); }
   setMain(`<div class="card stack"><h1 class="small">Something went wrong</h1><p>${esc(ex.message)}</p>
     <div><button class="btn secondary" type="button" onclick="location.reload()">Try again</button></div></div>`);
 }
 
-// ---------- views ----------
+// ---------- sign-in screens ----------
 
-function renderSignedOut() {
+const MIN_PASSWORD = 8;
+const TOKEN_KEY = 'pending-auth-link';
+
+// Reset and invite emails link to /#recovery_token=... or /#invite_token=....
+// Take the code out of the address bar right away (so it isn't left in history)
+// and keep it until the person submits a new password.
+function captureEmailLink() {
+  const m = location.hash.match(/^#\/?(recovery|invite|confirmation|email_change)_token=([^&]+)/);
+  if (!m) return;
+  try { sessionStorage.setItem(TOKEN_KEY, JSON.stringify({ type: m[1], token: decodeURIComponent(m[2]) })); } catch { /* private mode */ }
+  pendingLink = { type: m[1], token: decodeURIComponent(m[2]) };
+  history.replaceState(null, '', location.pathname + (m[1] === 'invite' ? '#/welcome' : '#/reset'));
+}
+let pendingLink = null;
+function getPendingLink() {
+  if (pendingLink) return pendingLink;
+  try { pendingLink = JSON.parse(sessionStorage.getItem(TOKEN_KEY) || 'null'); } catch { pendingLink = null; }
+  return pendingLink;
+}
+function clearPendingLink() {
+  pendingLink = null;
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+}
+
+function authFrame(title, body, sub = '') {
   me = null;
   renderShell('');
-  setMain(`<section class="landing">
+  setMain(`<section class="auth">
     <div class="bigdots" aria-hidden="true"><i style="background:var(--green)"></i><i style="background:var(--yellow)"></i><i style="background:var(--red)"></i></div>
-    <h1>Contract Check-In</h1>
-    <p>Call every janitorial customer, mark green, yellow or red, and see which sites need a visit first.</p>
-    <button class="btn" type="button" id="signin">Sign in</button>
-    <p class="small muted">New here? Use the invitation email you received, or ask your CRP or WVARF administrator to add you.</p>
+    <h1>${title}</h1>${sub ? `<p class="muted">${sub}</p>` : ''}
+    ${body}
   </section>`);
-  document.getElementById('signin').onclick = () => identity.open('login');
+}
+
+// Friendly words for the errors Netlify Identity returns.
+function authMessage(ex, context) {
+  const raw = String((ex && ex.message) || '').toLowerCase();
+  if (context === 'login' && /invalid|grant|password|not found|email/.test(raw)) {
+    return 'That email and password don\'t match. Check for typos, or reset your password below.';
+  }
+  if (context === 'link') {
+    return 'This link has already been used or has expired. Each link works once, and only the newest email works. Request a new link below.';
+  }
+  if (/network|fetch|timeout/.test(raw)) return 'Could not reach the sign-in service. Check your connection and try again.';
+  return (ex && ex.message) || 'Something went wrong. Please try again.';
+}
+
+function passwordFields(label = 'New password') {
+  return `
+    <div class="field"><label for="a-pw">${label}</label>
+      <input id="a-pw" name="password" type="password" autocomplete="new-password" minlength="${MIN_PASSWORD}" required>
+      <span class="hint">At least ${MIN_PASSWORD} characters.</span></div>
+    <div class="field"><label for="a-pw2">Type it again</label>
+      <input id="a-pw2" name="password2" type="password" autocomplete="new-password" minlength="${MIN_PASSWORD}" required></div>
+    <label class="choice"><input type="checkbox" id="a-show"> Show password</label>`;
+}
+function wireShowPassword() {
+  const box = main.querySelector('#a-show');
+  if (box) box.onchange = () => main.querySelectorAll('input[name^=password]').forEach((i) => { i.type = box.checked ? 'text' : 'password'; });
+}
+function checkNewPassword(d) {
+  if ((d.password || '').length < MIN_PASSWORD) throw new Error(`Use at least ${MIN_PASSWORD} characters.`);
+  if (d.password !== d.password2) throw new Error('The two passwords don\'t match.');
+}
+
+function renderSignIn({ note = '', email = '' } = {}) {
+  authFrame('Contract Check-In', `
+    ${note ? `<div class="banner info"><span>${esc(note)}</span></div>` : ''}
+    <form class="card stack" id="signin-form" method="post" action="#" novalidate>
+      <div class="field"><label for="a-email">Email</label>
+        <input id="a-email" name="email" type="email" autocomplete="username" inputmode="email" required value="${esc(email)}"></div>
+      <div class="field"><label for="a-pass">Password</label>
+        <input id="a-pass" name="password" type="password" autocomplete="current-password" required></div>
+      <button class="btn block" type="submit">Sign in</button>
+      <button class="btn secondary block" type="button" id="a-forgot">Forgot your password?</button>
+    </form>
+    <p class="small muted">New here? Use the invitation email you received, or ask your CRP or WVARF administrator to add you.</p>`,
+  'Call every janitorial customer, mark green, yellow or red, and see which sites need a visit first.');
+  const form = main.querySelector('#signin-form');
+  main.querySelector('#a-forgot').onclick = () => renderForgot({ email: form.email.value });
+  wireForm(form, async (d) => {
+    const mail = String(d.email || '').trim();
+    if (!mail || !d.password) throw new Error('Enter your email and password.');
+    try { await auth.login(mail, d.password); } catch (ex) { throw new Error(authMessage(ex, 'login')); }
+    setPractice(null);
+    me = null;
+    history.replaceState(null, '', '#/');
+    route();
+  });
+  (email ? form.password : form.email).focus();
+}
+
+function renderForgot({ email = '', note = '' } = {}) {
+  authFrame('Reset your password', `
+    ${note ? `<div class="form-error" role="alert">${esc(note)}</div>` : ''}
+    <form class="card stack" id="forgot-form" novalidate>
+      <div class="field"><label for="a-femail">Email</label>
+        <input id="a-femail" name="email" type="email" autocomplete="username" inputmode="email" required value="${esc(email)}"></div>
+      <button class="btn block" type="submit">Email me a reset link</button>
+      <button class="btn secondary block" type="button" id="a-back">Back to sign in</button>
+    </form>`, 'We\'ll email you a link to choose a new password.');
+  const form = main.querySelector('#forgot-form');
+  main.querySelector('#a-back').onclick = () => renderSignIn({ email: form.email.value });
+  wireForm(form, async (d) => {
+    const mail = String(d.email || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mail)) throw new Error('Enter the email you sign in with.');
+    try { await auth.requestPasswordRecovery(mail); } catch (ex) {
+      // Don't reveal whether an account exists; only report real connection problems.
+      if (/network|fetch|timeout/i.test(String(ex && ex.message))) throw new Error(authMessage(ex));
+    }
+    authFrame('Check your email', `
+      <div class="card stack">
+        <p>If <strong>${esc(mail)}</strong> has an account, a reset link is on its way. It comes from a Netlify address, so check your spam folder too.</p>
+        <p class="small muted">Use the link in the <strong>newest</strong> email only — asking again cancels earlier links.</p>
+        <button class="btn secondary block" type="button" id="a-back2">Back to sign in</button>
+      </div>`);
+    main.querySelector('#a-back2').onclick = () => renderSignIn({ email: mail });
+  });
+  form.email.focus();
+}
+
+// Opened from a reset or invite email. Nothing is redeemed until they submit.
+function renderSetPassword(link) {
+  const invite = link.type === 'invite';
+  if (link.type !== 'invite' && link.type !== 'recovery') {
+    clearPendingLink();
+    return renderSignIn({ note: 'That link isn\'t used by this app. Sign in below.' });
+  }
+  authFrame(invite ? 'Welcome! Set your password' : 'Choose a new password', `
+    <form class="card stack" id="setpw-form" novalidate>
+      <div class="field"><label for="a-semail">Your email</label>
+        <input id="a-semail" name="email" type="email" autocomplete="username" inputmode="email" required>
+        <span class="hint">The address this email was sent to.</span></div>
+      ${passwordFields(invite ? 'Password' : 'New password')}
+      <button class="btn block" type="submit">${invite ? 'Create my login' : 'Save new password'}</button>
+    </form>`,
+  invite ? 'You\'ve been invited to Contract Check-In.' : '');
+  wireShowPassword();
+  const form = main.querySelector('#setpw-form');
+  wireForm(form, async (d) => {
+    checkNewPassword(d);
+    let account;
+    try {
+      account = invite ? await auth.acceptInvite(link.token, d.password)
+        : await auth.recoverPassword(link.token, d.password);
+    } catch (ex) {
+      clearPendingLink();
+      renderForgot({ email: String(d.email || '').trim(), note: authMessage(ex, 'link') });
+      return;
+    }
+    clearPendingLink();
+    // @netlify/identity 2.0.0 doesn't write its sign-in cookie after an invite or
+    // reset, and then treats the person as signed out. The password is set now,
+    // so sign in with it to get a normal, lasting session.
+    const mail = (account && account.email) || String(d.email || '').trim();
+    try { await auth.login(mail, d.password); } catch {
+      return renderSignIn({ email: mail, note: 'Your password is saved. Please sign in with it.' });
+    }
+    me = null;
+    history.replaceState(null, '', '#/');
+    toast(invite ? 'Welcome! You\'re signed in.' : 'Password saved. You\'re signed in.');
+    route();
+  });
+  form.email.focus();
+}
+
+// ---------- views ----------
+
+async function viewAccount() {
+  setMain(`
+    <div class="page-head"><div><h1>Account</h1><div class="sub">Signed in as ${esc(me.email)}</div></div></div>
+    <div class="stack">
+      <form class="card stack" id="changepw-form" novalidate>
+        <h2 class="small" style="font-size:16px;color:var(--blue)">Change password</h2>
+        <input type="email" name="email" autocomplete="username" value="${esc(me.email)}" hidden readonly>
+        ${passwordFields('New password')}
+        <button class="btn" type="submit">Save new password</button>
+      </form>
+      <div class="card stack">
+        <h2 class="small" style="font-size:16px;color:var(--blue)">Sign out</h2>
+        <p class="small muted">On a shared computer, always sign out when you're done.</p>
+        <div><button class="btn danger" type="button" id="a-signout">Sign out</button></div>
+      </div>
+    </div>`);
+  wireShowPassword();
+  main.querySelector('#a-signout').onclick = signOut;
+  const form = main.querySelector('#changepw-form');
+  wireForm(form, async (d) => {
+    checkNewPassword(d);
+    try { await auth.updateUser({ password: d.password }); } catch (ex) { throw new Error(authMessage(ex)); }
+    form.reset();
+    toast('Password changed');
+  });
 }
 
 function renderNoAccess() {
@@ -162,17 +504,23 @@ function renderNoAccess() {
     <h1>Almost there</h1>
     <p>You're signed in as <strong>${esc(me.email)}</strong>, but your account isn't linked to a CRP yet.</p>
     <p class="muted">Ask your CRP administrator or WVARF to add this email address. Then refresh this page.</p>
-    <button class="btn secondary" type="button" onclick="location.reload()">Refresh</button>
+    <div class="row" style="justify-content:center">
+      <button class="btn secondary" type="button" onclick="location.reload()">Refresh</button>
+      <button class="btn secondary" type="button" id="a-signout2">Sign out</button>
+    </div>
   </section>`);
+  main.querySelector('#a-signout2').onclick = signOut;
 }
 
 async function viewContracts() {
   const data = await api('/contracts');
-  const { counts, contracts, calls_due, crp } = data;
+  const { counts, contracts, calls_due, crp, history } = data;
   const shown = listFilter === 'all' ? contracts
     : listFilter === 'due' ? contracts.filter((c) => c.call_due)
+    : listFilter === 'slipping' ? contracts.filter((c) => c.history.trend.direction === 'slipping')
     : contracts.filter((c) => (c.current_color || 'none') === listFilter);
-  const filters = [['all', 'All'], ['due', 'Calls due'], ['red', 'Red'], ['yellow', 'Yellow'], ['green', 'Green']];
+  const slipping = contracts.filter((c) => c.history.trend.direction === 'slipping').length;
+  const filters = [['all', 'All'], ['due', 'Calls due'], ['red', 'Red'], ['yellow', 'Yellow'], ['green', 'Green'], ['slipping', `Slipping (${slipping})`]];
   setMain(`
     <div class="page-head">
       <div><h1>Contracts</h1><div class="sub">${esc(crp.name)} · calls ${esc(SCHEDULES[crp.call_schedule].toLowerCase())}</div></div>
@@ -185,6 +533,8 @@ async function viewContracts() {
         <div class="tile green"><b>${counts.green}</b><span>Green</span></div>
       </div>
       ${calls_due ? `<div class="banner"><strong>${calls_due} ${calls_due === 1 ? 'call' : 'calls'} due</strong>&nbsp;— call by phone and mark a color.</div>` : ''}
+      ${contracts.length ? trendCard(history, crp.name) : ''}
+      <h2 class="section-title" style="margin-bottom:0">Contracts</h2>
       <div class="filters" role="group" aria-label="Filter contracts">
         ${filters.map(([k, l]) => `<button type="button" data-filter="${k}" aria-pressed="${listFilter === k}">${l}</button>`).join('')}
       </div>
@@ -198,6 +548,7 @@ async function viewContracts() {
             <span class="muted">${c.last_called_at ? `Last call ${fmtDate(c.last_called_at)}` : 'No calls yet'}</span>
             ${c.call_due ? '<span class="due">· Call due</span>' : ''}
           </div>
+          <div class="trendrow">${sparkline(c.history.scores, sparkLabel(c.history.scores))}${trendBadge(c.history.trend)}</div>
         </a>`).join('')}</div>`
         : `<div class="card empty">${contracts.length ? 'Nothing in this filter.' : 'No contracts yet. Add each janitorial contract to start.'}</div>`}
     </div>`);
@@ -207,7 +558,7 @@ async function viewContracts() {
 }
 
 async function viewContract(id) {
-  const { contract: c, calls, visits } = await api(`/contracts/${id}`);
+  const { contract: c, calls, visits, history: hist } = await api(`/contracts/${id}`);
   const history = [
     ...calls.map((x) => ({ at: x.called_at, html: `
       <div class="entry"><span class="dot ${x.color || 'none'}" aria-hidden="true"></span><div>
@@ -242,7 +593,7 @@ async function viewContract(id) {
     <a class="back" href="#/">${icons.back} Contracts</a>
     <div class="page-head">
       <div><h1>${esc(c.name)}</h1>
-        <div class="sub row">#${esc(c.contract_number)} ${typeTag(c.agreement_type)}${c.site_supervisor ? ` · Site supervisor: ${esc(c.site_supervisor)}` : ''}</div></div>
+        <div class="sub row">#${esc(c.contract_number)} ${typeTag(c.agreement_type)}${demoTag(c)}${c.site_supervisor ? ` · Site supervisor: ${esc(c.site_supervisor)}` : ''}</div></div>
       ${pill(c.current_color)}
     </div>
     <div class="stack">
@@ -252,6 +603,10 @@ async function viewContract(id) {
           ${c.call_due ? '<span class="due">· Call due now</span>' : `<span class="muted">· Next call ${fmtDate(c.call_due_at)}</span>`}
         </div>
         ${visitLine ? `<div class="small ${c.visit_overdue ? 'due' : ''}">${esc(visitLine)}${c.last_visited_at ? ` · last visit ${fmtDate(c.last_visited_at)}` : ''}</div>` : ''}
+        <div class="stack" style="gap:6px">
+          <div class="row" style="justify-content:space-between"><span class="label">Last 12 weeks</span>${trendBadge(hist.trend, { long: true })}</div>
+          ${weekStrip(hist.colors, hist.week_ends)}
+        </div>
         <div class="contacts">${contact(1, c.contact1_name, c.contact1_phone)}${contact(2, c.contact2_name, c.contact2_phone)}</div>
         ${(c.scope_link || c.checklist_link) ? `<div class="row small">
           ${c.scope_link ? `<a href="${esc(c.scope_link)}" target="_blank" rel="noopener">Scope of work</a>` : ''}
@@ -466,16 +821,26 @@ async function viewQueue() {
   });
 }
 
+let statewideDemo = false; // Real CRPs or Demo CRPs on the statewide view
+
 async function viewStatewide() {
-  const s = await api('/statewide');
+  const s = await api(`/statewide${statewideDemo ? '?demo=1' : ''}`);
+  if (statewideDemo && !s.has_demo) { statewideDemo = false; return viewStatewide(); }
   const t = s.totals;
   const pct = (n, d) => d ? Math.round((n / d) * 100) : 0;
   const bar = (r) => `<div class="bar" role="img" aria-label="${r.green} green, ${r.yellow} yellow, ${r.red} red, ${r.not_called} not called">
     <i class="g" style="width:${pct(r.green, r.total)}%"></i><i class="y" style="width:${pct(r.yellow, r.total)}%"></i>
     <i class="r" style="width:${pct(r.red, r.total)}%"></i><i class="n" style="width:${pct(r.not_called, r.total)}%"></i></div>`;
+  const scope = s.demo ? 'Demo CRPs' : 'Statewide';
   setMain(`
     <div class="page-head"><div><h1>Statewide view</h1><div class="sub">WVARF / State contracts only · private contracts are never shown · as of ${fmtWhen(s.as_of)}</div></div>
-      <button class="btn secondary small" type="button" onclick="window.print()">Print</button></div>
+      <div class="row">
+        ${s.has_demo ? `<div class="filters" role="group" aria-label="Which CRPs">
+          <button type="button" data-scope="real" aria-pressed="${!s.demo}">Real CRPs</button>
+          <button type="button" data-scope="demo" aria-pressed="${s.demo}">Demo CRPs</button></div>` : ''}
+        <button class="btn secondary small" type="button" onclick="window.print()">Print</button>
+      </div></div>
+    ${s.demo ? '<div class="banner info" style="margin-bottom:12px"><span><strong>Demo CRPs</strong> — made-up practice data, kept out of the real statewide numbers.</span></div>' : ''}
     <div class="stack">
       <div class="kpis">
         <div class="kpi"><span>State contracts</span><b>${t.total}</b><span>${s.crps.length} ${s.crps.length === 1 ? 'CRP' : 'CRPs'}</span></div>
@@ -484,15 +849,17 @@ async function viewStatewide() {
         <div class="kpi green"><span>Green</span><b>${t.green}</b><span>${pct(t.green, t.total)}% of contracts</span></div>
         <div class="kpi"><span>Called on schedule</span><b>${pct(t.on_schedule, t.total)}%</b><span>${t.total - t.on_schedule} overdue</span></div>
       </div>
+      ${t.total ? trendCard(s.history, scope) : ''}
       <section class="card">
         <h2 class="section-title" style="margin-top:0">By CRP</h2>
         ${s.crps.length ? `<div class="tablewrap"><table>
-          <thead><tr><th>CRP</th><th class="num">Contracts</th><th>Green / Yellow / Red</th><th class="num">Red</th><th class="num">Oldest red</th><th class="num">On schedule</th></tr></thead>
+          <thead><tr><th>CRP</th><th class="num">Contracts</th><th>Green / Yellow / Red now</th><th>12-week trend</th><th class="num">Red</th><th class="num">Oldest red</th><th class="num">On schedule</th></tr></thead>
           <tbody>${s.crps.map((r) => `<tr><td><strong>${esc(r.name)}</strong></td><td class="num">${r.total}</td><td>${bar(r)}</td>
+            <td><div class="trendrow">${sparkline(r.history.weeks.map((w) => w.score), `${r.name}: ${sparkLabel(r.history.weeks.map((w) => w.score))}`)}${trendBadge(r.history.trend)}</div></td>
             <td class="num" style="color:var(--red);font-weight:800">${r.red}</td>
             <td class="num">${r.oldest_red_days === null ? '—' : `${r.oldest_red_days} days`}</td>
             <td class="num">${pct(r.on_schedule, r.total)}%</td></tr>`).join('')}</tbody></table></div>`
-          : '<p class="muted">No WVARF / State contracts have been added yet.</p>'}
+          : `<p class="muted">${s.demo ? 'No demo data loaded.' : 'No WVARF / State contracts have been added yet.'}</p>`}
       </section>
       <section class="card">
         <h2 class="section-title" style="margin-top:0"><span class="dot red" aria-hidden="true"></span>Open reds</h2>
@@ -500,9 +867,12 @@ async function viewStatewide() {
           <thead><tr><th>Contract</th><th>CRP</th><th class="num">Days red</th><th>Visit</th></tr></thead>
           <tbody>${s.open_reds.map((r) => `<tr><td>${esc(r.name)} <span class="muted small">#${esc(r.contract_number)}</span></td><td>${esc(r.crp_name)}</td>
             <td class="num">${r.days_red}</td><td class="${r.visit_overdue && !r.last_visited_at ? 'due' : ''}">${r.last_visited_at ? `Visited ${fmtDate(r.last_visited_at)}` : esc(relDue(r.visit_due_at))}</td></tr>`).join('')}</tbody></table></div>`
-          : '<p class="muted">No open reds statewide.</p>'}
+          : '<p class="muted">No open reds.</p>'}
       </section>
     </div>`);
+  main.querySelectorAll('[data-scope]').forEach((b) => {
+    b.onclick = () => { statewideDemo = b.dataset.scope === 'demo'; viewStatewide().catch(errorView); };
+  });
 }
 
 // What happened to the sign-in invitation, in words for the admin.
@@ -605,21 +975,95 @@ async function viewAdmin() {
   });
 }
 
+async function viewDemo() {
+  const crps = await api('/demo');
+  const demoCrps = crps.filter((p) => p.is_demo);
+  const status = (p) => p.is_demo ? `<span class="tag demo">Demo CRP</span> <span class="small muted">${p.demo_contracts} made-up contracts</span>`
+    : p.can_use_for_demo ? '<span class="small muted">Empty — can hold demo data</span>'
+    : `<span class="small muted">Has ${p.real_contracts} real contract${p.real_contracts === 1 ? '' : 's'} — can't be used for the demo</span>`;
+  setMain(`
+    <div class="page-head"><div><h1>Demo</h1>
+      <div class="sub">A safe place for staff to try every feature with made-up data: six months of pretend calls and visits in every color.</div></div></div>
+    <div class="stack">
+      ${demoCrps.length ? `<section class="card stack">
+        <h2 class="cardtitle">Practice as a CRP</h2>
+        <p class="small" style="margin:0">Step into a demo CRP as if you were its CRP admin. Log calls, record visits, add contracts and watch the colors and trends change. People can't be added in practice mode, so no emails go out.</p>
+        <div class="list">${demoCrps.map((p) => `
+          <div class="card contract" style="box-shadow:none;border:1.5px solid var(--line)">
+            <div class="top"><div><div class="name">${esc(p.name)}</div><div class="meta">${p.demo_contracts} made-up contracts</div></div><span class="tag demo">Demo</span></div>
+            <button class="btn" type="button" data-practice="${p.id}" data-name="${esc(p.name)}">Practice as ${esc(p.name)}</button>
+          </div>`).join('')}</div>
+        <p class="small muted" style="margin:0">To compare the demo CRPs' trends, open <a href="#/statewide">Statewide</a> and switch to <strong>Demo CRPs</strong>.</p>
+      </section>` : ''}
+      <form class="card stack" id="demo-form" novalidate>
+        <h2 class="cardtitle">${demoCrps.length ? 'Reload or change the demo data' : 'Set up the demo'}</h2>
+        <p class="small" style="margin:0">Pick your test CRPs. Each gets 10 made-up contracts with 6 months of calls and visits: the first CRP's service is <strong>improving</strong> and the second's is <strong>slipping</strong>, with greens, yellows, reds, overdue calls and fixed problems in both. Loading again resets everything staff changed.</p>
+        <fieldset><legend>CRPs</legend>
+          ${crps.length ? crps.map((p) => `<label class="choice" style="justify-content:space-between;border-radius:12px;padding:10px 12px;min-height:48px">
+            <span class="row" style="gap:8px"><input type="checkbox" name="crp_ids[]" value="${p.id}" ${p.can_use_for_demo ? '' : 'disabled'} ${p.is_demo ? 'checked' : ''}> <strong>${esc(p.name)}</strong></span>
+            <span>${status(p)}</span></label>`).join('')
+            : '<p class="muted small">No CRPs yet. Add your test CRPs on the <a href="#/admin">People</a> page first.</p>'}
+        </fieldset>
+        <p class="hint" style="margin:0">Only CRPs with no real contracts can hold demo data, so real and made-up data never mix. Demo CRPs are left out of the real statewide numbers.</p>
+        <div class="row">
+          <button class="btn" type="submit">${demoCrps.length ? 'Reload demo data' : 'Load demo data'}</button>
+          ${demoCrps.length ? '<button class="btn danger" type="button" id="demo-clear">Remove all demo data</button>' : ''}
+        </div>
+      </form>
+      <section class="card stack">
+        <h2 class="cardtitle">Things to try</h2>
+        <ol class="small" style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px">
+          <li>Open <strong>Contracts</strong>: read the 12-week trend chart, then filter to <strong>Slipping</strong>.</li>
+          <li>Open a red contract, look at its 12-week strip and history, then <strong>Log a call</strong> and mark it yellow.</li>
+          <li>Go to <strong>Visits</strong>, start a visit on a red, check "Customer confirmed it's fixed", and mark it green.</li>
+          <li>Find the contract with <strong>Call due</strong> and log a "No answer" call — it stays due.</li>
+          <li>Add a contract of your own, then call it twice with different colors.</li>
+          <li>Exit practice and compare both demo CRPs on <strong>Statewide → Demo CRPs</strong>.</li>
+        </ol>
+      </section>
+    </div>`);
+  main.querySelectorAll('[data-practice]').forEach((b) => {
+    b.onclick = () => { setPractice({ id: Number(b.dataset.practice), name: b.dataset.name }); location.hash = '#/'; };
+  });
+  wireForm(main.querySelector('#demo-form'), async (d) => {
+    const ids = (d.crp_ids || []).map(Number);
+    if (!ids.length) throw new Error('Pick at least one CRP.');
+    if (demoCrps.length && !confirm('Reload the demo data? Anything staff changed in the demo CRPs will be reset.')) return;
+    const r = await api('/demo/load', { method: 'POST', body: { crp_ids: ids } });
+    toast(`Demo loaded: ${r.contracts} made-up contracts`);
+    viewDemo().catch(errorView);
+  });
+  const clear = main.querySelector('#demo-clear');
+  if (clear) clear.onclick = async () => {
+    if (!confirm('Remove all demo data? The demo CRPs stay, but their made-up contracts, calls and visits are deleted.')) return;
+    try { await api('/demo/clear', { method: 'POST', body: {} }); toast('Demo data removed'); viewDemo(); } catch (ex) { toast(ex.message); }
+  };
+}
+
 // ---------- router ----------
 
 async function route() {
-  if (!identity.currentUser()) return renderSignedOut();
+  captureEmailLink();
+  const link = getPendingLink();
+  if (link) return renderSetPassword(link);
+
+  let user = null;
+  try { user = await auth.getUser(); } catch { user = null; }
+  if (!user) return renderSignIn();
+
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   const key = parts[0] || '';
   try {
     if (!me) me = await api('/me');
     renderShell(key);
+    if (key === 'account') return await viewAccount();
     if (!me.crp && !me.is_wvarf_admin) return renderNoAccess();
     if (!me.crp && ['', 'contract', 'queue'].includes(key)) { location.hash = '#/statewide'; return; }
 
     if (key === '') return await viewContracts();
     if (key === 'queue') return await viewQueue();
     if (key === 'statewide' && me.is_wvarf_admin) return await viewStatewide();
+    if (key === 'demo' && me.is_wvarf_admin) return await viewDemo();
     if (key === 'admin' && (me.can_admin_crp || me.is_wvarf_admin)) return await viewAdmin();
     if (key === 'contract') {
       if (parts[1] === 'new') return await viewContractForm(null);
@@ -636,15 +1080,11 @@ async function route() {
   }
 }
 
-// The login widget starts itself when the page loads; begin routing once it is ready.
-let started = false;
-function start() {
-  if (started) return;
-  started = true;
-  window.addEventListener('hashchange', route);
-  route();
-}
-identity.on('init', start);
-identity.on('login', () => { identity.close(); me = null; if (started) route(); else start(); });
-identity.on('logout', () => { me = null; location.hash = '#/'; renderSignedOut(); });
-window.addEventListener('load', () => setTimeout(start, 0));
+window.addEventListener('hashchange', route);
+// Signing out in another tab signs out here too.
+try {
+  auth.onAuthChange((event) => {
+    if (event === auth.AUTH_EVENTS.LOGOUT && me) { me = null; renderSignIn({ note: 'You are signed out.' }); }
+  });
+} catch { /* older browsers */ }
+route();

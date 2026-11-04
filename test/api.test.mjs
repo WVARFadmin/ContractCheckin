@@ -38,7 +38,11 @@ before(async () => {
 });
 
 async function call(who, method, path, body) {
-  const headers = { 'content-type': 'application/json' };
+  return callWith(who, method, path, body, {});
+}
+
+async function callWith(who, method, path, body, extra) {
+  const headers = { 'content-type': 'application/json', ...extra };
   if (who) headers.authorization = `Bearer ${who}`;
   const res = await handle(new Request(`https://example.test/api${path}`, {
     method, headers, body: body ? JSON.stringify(body) : undefined,
@@ -338,4 +342,101 @@ test('unknown routes and bad bodies are handled', async () => {
   const res = await handle(new Request('https://example.test/api/contracts', {
     method: 'POST', headers: { authorization: 'Bearer ann@alpha.org' }, body: 'not json' }));
   assert.equal(res.status, 400);
+});
+
+
+// ---------- demo data, practice mode and trends ----------
+
+let demoOne, demoTwo;
+
+test('only WVARF loads demo data, and never into a CRP with real contracts', async () => {
+  demoOne = (await call('boss@wvarf.org', 'POST', '/admin/crps', { name: 'Theoretical One' })).body;
+  demoTwo = (await call('boss@wvarf.org', 'POST', '/admin/crps', { name: 'Theoretical Two' })).body;
+  assert.equal((await call('ann@alpha.org', 'POST', '/demo/load', { crp_ids: [demoOne.id] })).status, 403);
+  const status = (await call('boss@wvarf.org', 'GET', '/demo')).body;
+  assert.equal(status.find((p) => p.name === 'Alpha Industries').can_use_for_demo, false);
+  assert.equal(status.find((p) => p.name === 'Theoretical One').can_use_for_demo, true);
+  const mixed = await call('boss@wvarf.org', 'POST', '/demo/load', { crp_ids: [demoOne.id, crpA.id] });
+  assert.equal(mixed.status, 409);
+  assert.equal((await call('boss@wvarf.org', 'GET', '/demo')).body.filter((p) => p.is_demo).length, 0, 'nothing loaded on refusal');
+});
+
+test('loading the demo creates history in every color', async () => {
+  const r = await call('boss@wvarf.org', 'POST', '/demo/load', { crp_ids: [demoOne.id, demoTwo.id] });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.contracts, 20);
+  const counts = await db.query(`SELECT color, count(*)::int AS n FROM calls c JOIN contracts k ON k.id = c.contract_id
+    WHERE k.is_demo AND color IS NOT NULL GROUP BY color ORDER BY color`);
+  assert.deepEqual(counts.rows.map((x) => x.color), ['green', 'red', 'yellow']);
+});
+
+test('practice mode: WVARF admin works inside a demo CRP only', async () => {
+  const hdr = (id) => ({ 'x-practice-crp': String(id) });
+  const me = await callWith('boss@wvarf.org', 'GET', '/me', null, hdr(demoOne.id));
+  assert.equal(me.body.practice, true);
+  assert.equal(me.body.crp.name, 'Theoretical One');
+  assert.equal(me.body.can_admin_crp, false, 'People tab hidden in practice');
+  const list = await callWith('boss@wvarf.org', 'GET', '/contracts', null, hdr(demoOne.id));
+  assert.equal(list.body.contracts.length, 10);
+  assert.ok(list.body.history.weeks.length === 12 && list.body.history.trend.direction);
+  assert.ok(list.body.contracts.every((c) => c.history.scores.length === 12));
+  // A real CRP can never be entered this way.
+  assert.equal((await callWith('boss@wvarf.org', 'GET', '/contracts', null, hdr(crpA.id))).status, 403);
+  // Only WVARF admins can practice.
+  assert.equal((await callWith('ann@alpha.org', 'GET', '/contracts', null, hdr(demoOne.id))).status, 403);
+  // No people changes (and so no invitation emails) in practice mode.
+  const before = invited.length;
+  assert.equal((await callWith('boss@wvarf.org', 'POST', '/admin/members', { email: 'x@demo.org' }, hdr(demoOne.id))).status, 403);
+  assert.equal((await callWith('boss@wvarf.org', 'GET', '/admin/members', null, hdr(demoOne.id))).status, 403);
+  assert.equal(invited.length, before);
+  // Practicing works end to end: log a call, add a contract (it becomes demo data).
+  const c = list.body.contracts[0];
+  assert.equal((await callWith('boss@wvarf.org', 'POST', `/contracts/${c.id}/calls`, { color: 'red' }, hdr(demoOne.id))).status, 201);
+  const added = await callWith('boss@wvarf.org', 'POST', '/contracts', { contract_number: 'MINE-1', name: 'Practice site', agreement_type: 'state' }, hdr(demoOne.id));
+  assert.equal(added.status, 201);
+  assert.equal(added.body.is_demo, true);
+});
+
+test('the first demo CRP is improving and the second is slipping', async () => {
+  // Fresh load at the real time, so the 12-week window lines up with the demo story.
+  const realNow = new Date();
+  const saved = clock; clock = realNow;
+  await call('boss@wvarf.org', 'POST', '/demo/load', { crp_ids: [demoOne.id, demoTwo.id] });
+  const one = await callWith('boss@wvarf.org', 'GET', '/contracts', null, { 'x-practice-crp': String(demoOne.id) });
+  const two = await callWith('boss@wvarf.org', 'GET', '/contracts', null, { 'x-practice-crp': String(demoTwo.id) });
+  assert.equal(one.body.history.trend.direction, 'improving');
+  assert.equal(two.body.history.trend.direction, 'slipping');
+  assert.ok(!one.body.contracts.some((c) => c.contract_number === 'MINE-1'), 'reloading resets staff changes');
+  const dirs = new Set([...one.body.contracts, ...two.body.contracts].map((c) => c.history.trend.direction));
+  assert.ok(dirs.has('improving') && dirs.has('slipping') && dirs.has('steady'));
+  const detail = await callWith('boss@wvarf.org', 'GET', `/contracts/${two.body.contracts[0].id}`, null, { 'x-practice-crp': String(demoTwo.id) });
+  assert.equal(detail.body.history.colors.length, 12);
+  assert.equal(detail.body.history.week_ends.length, 12);
+  clock = saved;
+});
+
+test('statewide keeps demo CRPs out of the real numbers', async () => {
+  const real = await call('boss@wvarf.org', 'GET', '/statewide');
+  assert.ok(!real.body.crps.some((c) => c.name.startsWith('Theoretical')));
+  assert.equal(real.body.has_demo, true);
+  assert.ok(real.body.history.weeks.length === 12);
+  assert.ok(real.body.crps.every((c) => c.history && c.history.trend));
+  const demo = await call('boss@wvarf.org', 'GET', '/statewide?demo=1');
+  assert.deepEqual(demo.body.crps.map((c) => c.name).sort(), ['Theoretical One', 'Theoretical Two']);
+  assert.ok(!JSON.stringify(demo.body).includes('Alpha'));
+  assert.ok(!JSON.stringify(demo.body).includes('Credit Union') && !JSON.stringify(demo.body).includes('Bank'), 'private demo contracts stay private');
+});
+
+test('reloading with fewer CRPs drops the others; removing clears everything', async () => {
+  await call('boss@wvarf.org', 'POST', '/demo/load', { crp_ids: [demoOne.id] });
+  let st = (await call('boss@wvarf.org', 'GET', '/demo')).body;
+  assert.equal(st.find((p) => p.id === demoTwo.id).is_demo, false);
+  assert.equal(st.find((p) => p.id === demoTwo.id).demo_contracts, 0);
+  const r = await call('boss@wvarf.org', 'POST', '/demo/clear', {});
+  assert.equal(r.status, 201);
+  st = (await call('boss@wvarf.org', 'GET', '/demo')).body;
+  assert.ok(st.every((p) => !p.is_demo && p.demo_contracts === 0));
+  assert.equal((await callWith('boss@wvarf.org', 'GET', '/contracts', null, { 'x-practice-crp': String(demoOne.id) })).status, 403);
+  // Real contracts untouched.
+  assert.equal((await call('bob@beta.org', 'GET', '/contracts')).body.contracts.length, 1);
 });

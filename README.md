@@ -30,12 +30,41 @@ Every call and visit records who logged it and when.
    - **Values:** Same value for all deploy contexts, then type the email, for example `nshippy@wvarf.org`. For more than one, separate them with commas and no spaces.
 
    Click **Create variable**. These people are always WVARF admins. Then go to **Deploys** and use **Trigger deploy** so the app picks up the setting.
-4. **Invite yourself.** From the Identity tab, invite your own email, accept the email invitation, and set a password. Sign in — you'll land on the statewide view.
+4. **Invite yourself.** From the Identity tab, invite your own email. Open the invitation, enter your email and choose a password, and you're signed in on the statewide view.
 5. **Add CRPs and people.** In the app, open **People**: add each CRP, then add each person's email with their CRP and role. **Adding a new person emails them their invitation automatically** — no Netlify step. They click the link, set a password, and land in their CRP.
 
 > CRP admins add and invite their own supervisors the same way; WVARF doesn't need to be involved. Each person on the People screen has a **Send invite** button to resend an invitation that was missed or expired. The invitation comes from a Netlify address, so ask people to check their spam folder.
 >
 > If someone was added before automatic invitations were turned on, use **Send invite** next to their name.
+
+## Signing in and passwords
+
+- Sign-in, "Forgot your password?", invitations and **Account → Change password** all happen on the app's own screens, so browsers and password managers (such as Google Password Manager) offer to save the password.
+- **Reset and invitation links are only used when the person submits their new password**, not when the link is opened. Email security scanners that open links first (common with Microsoft 365) no longer break them.
+- Each link works once, and asking for a new reset email cancels the older one. If someone uses an old or used link, the app says so and lets them request a new one on the spot.
+- **Locked out with no working email?** In Netlify, open **Identity → Users**, delete that person's login (their app access and history are kept — they live in the app's database), then add them again with **Send invite** on the People screen, or invite them from the Identity tab.
+
+## Trends
+
+The Contracts page (for each CRP) and the Statewide page (for WVARF) show the **last 12 weeks**:
+
+- A chart of the share of contracts that were green, yellow and red each week. Hover a bar, or open **Show as a table**, for the counts.
+- A **service score**: green = 100, yellow = 50, red = 0, averaged across contracts.
+- A trend word for the CRP and for every contract: **Improving**, **Steady** or **Slipping**. It compares the average score over the last 4 weeks with the first 4 weeks of the 12, about 2–3 months earlier. A change of 10 points or more counts as a trend. Contracts with under about 5 weeks of history show **New — not enough history**.
+- Each contract's page shows a 12-week color strip, one square per week. The Contracts list has a **Slipping** filter.
+
+A week's color is the contract's color at the end of that week: the most recent answered call, or a fix the customer confirmed on a visit.
+
+## Demo (practice) data
+
+WVARF admins have a **Demo** tab, a safe place for staff to try every feature.
+
+1. Add one or two test CRPs on the People page (or use ones you already made). They must have no real contracts.
+2. On **Demo**, tick them and click **Load demo data**. Each gets 10 made-up contracts with 6 months of calls and visits in every color. The first CRP's service is improving and the second's is slipping.
+3. Click **Practice as …** to work inside that CRP as its CRP admin. A yellow banner shows you're in practice mode; **Exit practice** takes you back.
+4. Compare the demo CRPs on **Statewide → Demo CRPs**. Demo CRPs never appear in the real statewide numbers.
+
+**Reload demo data** resets everything staff changed. **Remove all demo data** deletes the made-up contracts (the CRPs themselves stay). People can't be added in practice mode, so no invitation emails go out. All demo names, phone numbers (555-01xx) and caller addresses (example.org) are fictional.
 
 ## How the rules work
 
@@ -48,14 +77,16 @@ Every call and visit records who logged it and when.
 ```
 npm install
 npm test                      # API tests against an in-memory Postgres (privacy rules included)
-node test/dev-server.mjs      # local preview at http://localhost:8888 with a stand-in sign-in
+node test/dev-server.mjs      # local preview at http://localhost:8888 with a stand-in sign-in service
+npm run build:vendor          # only when upgrading @netlify/identity: rebuilds public/vendor/
 ```
 
-The local preview uses a fake sign-in where you type any email; `admin@wvarf.test` is the WVARF admin. Nothing is saved after it stops. To run against Netlify's real services instead, use `netlify dev`.
+In the local preview, any new email signs in with whatever password you type; `admin@wvarf.test` is the WVARF admin. Reset and invitation "emails" are printed in the terminal instead of sent. Nothing is saved after it stops. To run against Netlify's real services instead, use `netlify dev`.
 
 | Path | What it is |
 | --- | --- |
 | `public/` | The app people use (HTML, CSS, JavaScript — no build step) |
+| `public/vendor/netlify-identity.js` | Netlify's sign-in library, packaged with `npm run build:vendor` |
 | `netlify/functions/api.mjs` | The API endpoint: connects the database and verifies sign-in |
 | `lib/api-core.mjs` | All API rules: who can see what, colors, due dates |
 | `netlify/database/migrations/` | Database tables. Add new numbered files for changes; never edit old ones |

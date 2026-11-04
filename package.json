@@ -6,12 +6,15 @@
   "type": "module",
   "scripts": {
     "dev": "netlify dev",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "build:vendor": "esbuild node_modules/@netlify/identity/dist/main.js --bundle --format=esm --platform=browser --minify --legal-comments=eof --outfile=public/vendor/netlify-identity.js"
   },
   "dependencies": {
     "@netlify/database": "^2.0.1"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.15"
+    "@electric-sql/pglite": "^0.5.15",
+    "@netlify/identity": "2.0.0",
+    "esbuild": "0.25.12"
   }
 }
