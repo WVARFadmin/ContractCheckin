@@ -188,6 +188,21 @@ function readCookie(name) {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
+// Sign in, and get past a stale sign-in cookie if one is in the way.
+// The old Netlify pop-up had Netlify store the login in an HttpOnly nf_jwt cookie.
+// The page can't read or replace that cookie, so after a successful login the
+// library's own cookie is missing and it treats the person as signed out. When
+// that happens, ask the server to delete the old cookie, then sign in again.
+async function signIn(email, password) {
+  await auth.login(email, password);
+  if (readCookie('nf_jwt')) return;
+  try { await fetch('/api/session/reset', { method: 'POST', credentials: 'same-origin' }); } catch { /* try anyway */ }
+  await auth.login(email, password);
+  if (!readCookie('nf_jwt')) {
+    throw Object.assign(new Error('Your browser blocked the sign-in cookie. Allow cookies for this site, or try a private window.'), { cookie: true });
+  }
+}
+
 // The library keeps the current login in the nf_jwt cookie and refreshes it
 // shortly before it expires.
 async function accessToken() {
@@ -387,7 +402,7 @@ function renderSignIn({ note = '', email = '' } = {}) {
   wireForm(form, async (d) => {
     const mail = String(d.email || '').trim();
     if (!mail || !d.password) throw new Error('Enter your email and password.');
-    try { await auth.login(mail, d.password); } catch (ex) { throw new Error(authMessage(ex, 'login')); }
+    try { await signIn(mail, d.password); } catch (ex) { throw new Error(ex.cookie ? ex.message : authMessage(ex, 'login')); }
     setPractice(null);
     me = null;
     history.replaceState(null, '', '#/');
@@ -459,7 +474,7 @@ function renderSetPassword(link) {
     // reset, and then treats the person as signed out. The password is set now,
     // so sign in with it to get a normal, lasting session.
     const mail = (account && account.email) || String(d.email || '').trim();
-    try { await auth.login(mail, d.password); } catch {
+    try { await signIn(mail, d.password); } catch {
       return renderSignIn({ email: mail, note: 'Your password is saved. Please sign in with it.' });
     }
     me = null;

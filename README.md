@@ -42,6 +42,7 @@ Every call and visit records who logged it and when.
 - Sign-in, "Forgot your password?", invitations and **Account → Change password** all happen on the app's own screens, so browsers and password managers (such as Google Password Manager) offer to save the password.
 - **Reset and invitation links are only used when the person submits their new password**, not when the link is opened. Email security scanners that open links first (common with Microsoft 365) no longer break them.
 - Each link works once, and asking for a new reset email cancels the older one. If someone uses an old or used link, the app says so and lets them request a new one on the spot.
+- **Signed in but bounced back to the sign-in screen?** That was a leftover cookie from the old Netlify sign-in pop-up. The app now clears it automatically on sign-in. If it ever happens anyway, a private/incognito window, or clearing this site's cookies, gets around it.
 - **Locked out with no working email?** In Netlify, open **Identity → Users**, delete that person's login (their app access and history are kept — they live in the app's database), then add them again with **Send invite** on the People screen, or invite them from the Identity tab.
 
 ## Trends

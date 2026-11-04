@@ -440,3 +440,13 @@ test('reloading with fewer CRPs drops the others; removing clears everything', a
   // Real contracts untouched.
   assert.equal((await call('bob@beta.org', 'GET', '/contracts')).body.contracts.length, 1);
 });
+
+test('session reset clears server-only sign-in cookies without needing a login', async () => {
+  const res = await handle(new Request('https://example.test/api/session/reset', { method: 'POST' }));
+  assert.equal(res.status, 204);
+  const cookies = res.headers.getSetCookie();
+  assert.equal(cookies.length, 2);
+  assert.ok(cookies.some((c) => c.startsWith('nf_jwt=;') && /Max-Age=0/.test(c) && /HttpOnly/.test(c)));
+  assert.ok(cookies.some((c) => c.startsWith('nf_refresh=;')));
+  assert.equal((await handle(new Request('https://example.test/api/session/reset'))).status, 405);
+});

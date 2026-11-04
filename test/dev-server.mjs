@@ -112,7 +112,11 @@ http.createServer(async (req, res) => {
   if (url.pathname === '/__preview/events') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify(events)); }
   if (url.pathname.startsWith('/api/')) {
     const r = await handle(new Request(url, { method: req.method, headers: req.headers, body: chunks.length ? body : undefined }));
-    res.writeHead(r.status, Object.fromEntries(r.headers));
+    // Pass every Set-Cookie through separately, as Netlify does.
+    const headers = Object.fromEntries([...r.headers].filter(([k]) => k !== 'set-cookie'));
+    const cookies = r.headers.getSetCookie();
+    if (cookies.length) headers['set-cookie'] = cookies;
+    res.writeHead(r.status, headers);
     return res.end(await r.text());
   }
   const p = normalize(join(root, url.pathname === '/' ? 'index.html' : url.pathname));
